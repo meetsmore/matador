@@ -1,12 +1,6 @@
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import amqplib, { type ChannelModel } from 'amqplib';
 import { TopologyBuilder } from '../../topology/index.js';
-
-// Hoisted by Bun before static imports are resolved.
-// Keeps amqplib out of the other rabbitmq-transport.test.ts which relies on
-// real connection failures for its logging assertions.
-mock.module('amqplib', () => {
-  return { default: { connect: mockConnect } };
-});
 
 // ─── Shared mock state ────────────────────────────────────────────────────────
 
@@ -99,9 +93,14 @@ const topology = TopologyBuilder.create()
 
 describe('RabbitMQTransport – consumer recreation on reconnect', () => {
   let transport: RabbitMQTransport;
+  let restoreConnect: (() => void) | undefined;
 
   beforeEach(async () => {
     resetMockState();
+    const connect = spyOn(amqplib, 'connect').mockImplementation(
+      async () => (await mockConnect()) as unknown as ChannelModel,
+    );
+    restoreConnect = () => connect.mockRestore();
     transport = new RabbitMQTransport({
       url: 'amqp://localhost:5672',
       connectionName: 'test',
@@ -112,6 +111,15 @@ describe('RabbitMQTransport – consumer recreation on reconnect', () => {
     });
     await transport.connect();
     await transport.applyTopology(topology);
+  });
+
+  afterEach(async () => {
+    try {
+      await transport?.disconnect();
+    } finally {
+      restoreConnect?.();
+      restoreConnect = undefined;
+    }
   });
 
   it('registers one consumer per queue on initial connect', async () => {

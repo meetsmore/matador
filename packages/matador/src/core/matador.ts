@@ -31,6 +31,9 @@ import type { SendResult } from './fanout.js';
 import { FanoutEngine } from './fanout.js';
 import type { HandlersState, ShutdownConfig } from './shutdown.js';
 import { ShutdownManager } from './shutdown.js';
+import type { MatadorStartupRetryConfig } from './startup-config.js';
+
+export type { MatadorStartupRetryConfig } from './startup-config.js';
 
 /**
  * Configuration for Matador.
@@ -47,6 +50,15 @@ export interface MatadorConfig {
 
   /** Queues to consume from (empty = no consumption) */
   readonly consumeFrom?: readonly string[] | undefined;
+
+  /**
+   * Recover from transport connect, topology, or subscription failures during
+   * startup. Presence enables retries; an empty object uses the defaults.
+   * Schema/configuration validation failures are never retried.
+   *
+   * @default undefined (do not retry rejected startup operations)
+   */
+  readonly startupRetry?: MatadorStartupRetryConfig | undefined;
 
   /** Custom codec (defaults to JSON) */
   readonly codec?: Codec | undefined;

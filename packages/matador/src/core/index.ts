@@ -9,4 +9,5 @@ export type {
 export { defaultShutdownConfig, ShutdownManager } from './shutdown.js';
 
 export type { MatadorConfig } from './matador.js';
+export type { MatadorStartupRetryConfig } from './startup-config.js';
 export { Matador } from './matador.js';

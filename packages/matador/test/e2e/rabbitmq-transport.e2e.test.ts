@@ -12,7 +12,16 @@ import {
   type StartedRabbitMQContainer,
 } from '@testcontainers/rabbitmq';
 import amqplib from 'amqplib';
-import type { Topology } from '../../src/topology/types.js';
+import {
+  type Envelope,
+  Matador,
+  MatadorEvent,
+  type MatadorSchema,
+  createEnvelope,
+  createSubscriber,
+} from '../../src/index.js';
+import { StandardRetryPolicy } from '../../src/retry/index.js';
+import type { QueueDefinition, Topology } from '../../src/topology/types.js';
 import type { Subscription } from '../../src/transport/index.js';
 import { RabbitMQTransport } from '../../src/transport/rabbitmq/rabbitmq-transport.js';
 import {
@@ -82,7 +91,10 @@ describe.skipIf(SKIP_E2E)('RabbitMQ Transport E2E', () => {
 
     it('should handle message priority', async () => {
       const topology = createTestTopology(`priority-${Date.now()}`);
-      topology.queues[0] = { ...topology.queues[0], priorities: true };
+      (topology.queues as unknown as QueueDefinition[])[0] = {
+        ...topology.queues[0],
+        priorities: true,
+      };
 
       await transport.applyTopology(topology);
       const queueName = `${topology.namespace}.events`;
@@ -664,6 +676,389 @@ describe.skipIf(SKIP_E2E)('RabbitMQ Transport E2E', () => {
       // Each queue should respect its own prefetch
       expect(queue1MaxConcurrent).toBeLessThanOrEqual(2);
       expect(queue2MaxConcurrent).toBeLessThanOrEqual(3);
+    });
+  });
+
+  describe('single active consumer', () => {
+    let transport: RabbitMQTransport;
+    let subscriptions: Subscription[] = [];
+
+    beforeEach(async () => {
+      transport = new RabbitMQTransport({
+        url: connectionUrl,
+        connectionName: 'matador-sac-test',
+        quorumQueues: false,
+        defaultPrefetch: 1,
+      });
+      await transport.connect();
+    });
+
+    afterEach(async () => {
+      for (const sub of subscriptions) {
+        if (sub.isActive) {
+          await sub.unsubscribe();
+        }
+      }
+      subscriptions = [];
+      if (transport.isConnected()) {
+        await transport.disconnect();
+      }
+    });
+
+    it('routes messages to only one of several consumers, failing over when it disconnects', async () => {
+      const topology = createTestTopology(`sac-${Date.now()}`);
+      (topology.queues as unknown as QueueDefinition[])[0] = {
+        ...topology.queues[0],
+        singleActiveConsumer: true,
+      };
+      await transport.applyTopology(topology);
+      const queueName = `${topology.namespace}.events`;
+
+      const receivedByA: string[] = [];
+      const receivedByB: string[] = [];
+
+      const subA = await transport.subscribe(
+        queueName,
+        async (env, receipt) => {
+          receivedByA.push(env.id);
+          await transport.complete(receipt);
+        },
+      );
+      subscriptions.push(subA);
+
+      const subB = await transport.subscribe(
+        queueName,
+        async (env, receipt) => {
+          receivedByB.push(env.id);
+          await transport.complete(receipt);
+        },
+      );
+      subscriptions.push(subB);
+
+      for (let i = 0; i < 5; i++) {
+        await transport.send(queueName, createTestEnvelope({ id: `sac-${i}` }));
+      }
+
+      await waitFor(() => receivedByA.length + receivedByB.length >= 5, 5000);
+
+      // Only the (first-subscribed) active consumer should receive messages
+      // while both remain subscribed.
+      expect(receivedByA.length).toBe(5);
+      expect(receivedByB.length).toBe(0);
+
+      // Disconnecting the active consumer should fail over to the other one.
+      await subA.unsubscribe();
+      subscriptions = subscriptions.filter((s) => s !== subA);
+
+      for (let i = 5; i < 10; i++) {
+        await transport.send(queueName, createTestEnvelope({ id: `sac-${i}` }));
+      }
+
+      await waitFor(() => receivedByB.length >= 5, 5000);
+      expect(receivedByB.length).toBe(5);
+    });
+  });
+
+  describe('subscriber idempotency', () => {
+    let matador: Matador | undefined;
+
+    afterEach(async () => {
+      if (matador) {
+        await matador.shutdown().catch(() => {});
+        matador = undefined;
+      }
+    });
+
+    class IdempotencyTestEvent extends MatadorEvent {
+      static readonly key = 'idempotency-test.event';
+      static readonly description =
+        'Event used to exercise idempotent retry behavior';
+      constructor(public data: { id: string }) {
+        super();
+      }
+    }
+
+    /**
+     * Pulls and nack-requeues one message from a throwaway channel, simulating a worker
+     * crashing before it acks. RabbitMQ marks the next delivery of that message
+     * `redelivered: true` which is checked by StandardRetryPolicy's idempotency rule
+     */
+    async function forceNativeRedelivery(queueName: string): Promise<void> {
+      const conn = await amqplib.connect(connectionUrl);
+      const channel = await conn.createChannel();
+      try {
+        const msg = await channel.get(queueName, { noAck: false });
+        if (!msg) {
+          throw new Error(`Expected a message on '${queueName}'`);
+        }
+        channel.nack(msg, false, true);
+      } finally {
+        await channel.close();
+        await conn.close();
+      }
+    }
+
+    /**
+     * Polls a queue with a throwaway channel until a message appears (acking it),
+     * or returns null after timeoutMs. Used to observe where the real pipeline
+     * routed a message (source queue vs. dead-letter queue) without racing a
+     * long-lived consumer against the assertions.
+     */
+    async function pollForMessage(
+      queueName: string,
+      timeoutMs: number,
+    ): Promise<Pick<Envelope, 'data'> | null> {
+      const conn = await amqplib.connect(connectionUrl);
+      const channel = await conn.createChannel();
+      try {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          const msg = await channel.get(queueName, { noAck: true });
+          if (msg) {
+            return {
+              data: JSON.parse(msg.content.toString()),
+            };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return null;
+      } finally {
+        await channel.close();
+        await conn.close();
+      }
+    }
+
+    it('dead-letters a non-idempotent subscriber after an exception', async () => {
+      const namespace = `idempotent-no-${Date.now()}`;
+      const topology = createTestTopology(namespace);
+      const queueName = `${namespace}.events`;
+      const dlqQueueName = `${queueName}.undeliverable`;
+
+      let callCount = 0;
+      const subscriber = createSubscriber<IdempotencyTestEvent>({
+        name: 'non-idempotent-subscriber',
+        description: 'Cannot safely handle a duplicate delivery',
+        idempotent: 'no',
+        callback: async () => {
+          callCount++;
+          throw new Error('Simulated processing failure');
+        },
+      });
+
+      const schema: MatadorSchema = {
+        [IdempotencyTestEvent.key]: [IdempotencyTestEvent, [subscriber]],
+      };
+
+      const transport = new RabbitMQTransport({
+        url: connectionUrl,
+        connectionName: `idempotent-no-${Date.now()}`,
+        quorumQueues: false,
+        defaultPrefetch: 1,
+      });
+
+      matador = new Matador({
+        transport,
+        topology,
+        schema,
+        consumeFrom: ['events'],
+        retryPolicy: new StandardRetryPolicy({ baseDelay: 0, maxDelay: 0 }),
+      });
+      await matador.start();
+
+      const event = new IdempotencyTestEvent({
+        id: 'idempotent-no',
+      });
+
+      const result = await matador.send(event);
+
+      // Wait for processing
+      await matador.waitForIdle(5000);
+
+      expect(result.subscribersSent).toBe(1);
+      expect(result.errors).toHaveLength(0);
+      expect(callCount).toBe(1);
+
+      const dlqEnvelope = (await pollForMessage(dlqQueueName, 5000)) as Pick<
+        Envelope<IdempotencyTestEvent>,
+        'data'
+      >;
+      expect(dlqEnvelope?.data.data.id).toBe('idempotent-no');
+    });
+
+    it('dead-letters a non-idempotent subscriber after a crash', async () => {
+      const namespace = `idempotent-no-${Date.now()}`;
+      const topology = createTestTopology(namespace);
+      const queueName = `${namespace}.events`;
+      const dlqQueueName = `${queueName}.undeliverable`;
+
+      let callCount = 0;
+      const subscriber = createSubscriber<IdempotencyTestEvent>({
+        name: 'non-idempotent-subscriber',
+        description: 'Cannot safely handle a duplicate delivery',
+        idempotent: 'no',
+        callback: async () => {
+          callCount++;
+          throw new Error('Execution should not reach this point');
+        },
+      });
+
+      const schema: MatadorSchema = {
+        [IdempotencyTestEvent.key]: [IdempotencyTestEvent, [subscriber]],
+      };
+
+      const transport = new RabbitMQTransport({
+        url: connectionUrl,
+        connectionName: `idempotent-no-${Date.now()}`,
+        quorumQueues: false,
+        defaultPrefetch: 1,
+      });
+
+      // Pre-seed the queue and force a native redelivery *before* Matador starts
+      // consuming, so the very first delivery its real pipeline sees already
+      // carries the broker's redelivered:true flag.
+      await transport.connect();
+      await transport.applyTopology(topology);
+      await transport.send(
+        queueName,
+        createEnvelope({
+          eventKey: IdempotencyTestEvent.key,
+          targetSubscriber: subscriber.name,
+          data: { id: 'idempotent-no' },
+          importance: 'should-investigate',
+        }),
+      );
+      await forceNativeRedelivery(queueName);
+
+      matador = new Matador({
+        transport,
+        topology,
+        schema,
+        consumeFrom: ['events'],
+        retryPolicy: new StandardRetryPolicy({ baseDelay: 0, maxDelay: 0 }),
+      });
+      await matador.start();
+
+      const dlqEnvelope = (await pollForMessage(dlqQueueName, 5000)) as Pick<
+        Envelope<IdempotencyTestEvent>,
+        'data'
+      >;
+      expect(dlqEnvelope?.data.data.id).toBe('idempotent-no');
+      expect(callCount).toBe(0);
+    });
+
+    it('retries an idempotent subscriber after an exception', async () => {
+      const namespace = `idempotent-yes-${Date.now()}`;
+      const topology = createTestTopology(namespace);
+      const queueName = `${namespace}.events`;
+
+      let callCount = 0;
+      let success = false;
+      const subscriber = createSubscriber<IdempotencyTestEvent>({
+        name: 'idempotent-subscriber',
+        description: 'Can safely handle a duplicate delivery',
+        idempotent: 'yes',
+        callback: async () => {
+          callCount++;
+          if (callCount === 1) {
+            throw new Error('Simulated processing failure');
+          }
+          success = true;
+        },
+      });
+
+      const schema: MatadorSchema = {
+        [IdempotencyTestEvent.key]: [IdempotencyTestEvent, [subscriber]],
+      };
+
+      const transport = new RabbitMQTransport({
+        url: connectionUrl,
+        connectionName: `idempotent-yes-${Date.now()}`,
+        quorumQueues: false,
+        defaultPrefetch: 1,
+      });
+
+      matador = new Matador({
+        transport,
+        topology,
+        schema,
+        consumeFrom: ['events'],
+        retryPolicy: new StandardRetryPolicy({ baseDelay: 0, maxDelay: 0 }),
+      });
+      await matador.start();
+
+      const event = new IdempotencyTestEvent({
+        id: 'idempotent-yes',
+      });
+
+      const result = await matador.send(event);
+
+      // Wait for processing
+      await matador.waitForIdle(10_000);
+
+      expect(result.subscribersSent).toBe(1);
+      expect(result.errors).toHaveLength(0);
+      expect(callCount).toBe(2);
+      expect(success).toBeTruthy();
+    });
+
+    it('retries an idempotent subscriber after a crash', async () => {
+      const namespace = `idempotent-yes-${Date.now()}`;
+      const topology = createTestTopology(namespace);
+      const queueName = `${namespace}.events`;
+
+      let callCount = 0;
+      let success = false;
+      const subscriber = createSubscriber<IdempotencyTestEvent>({
+        name: 'idempotent-subscriber',
+        description: 'Can safely handle a duplicate delivery',
+        idempotent: 'yes',
+        callback: async () => {
+          callCount++;
+          success = true;
+        },
+      });
+
+      const schema: MatadorSchema = {
+        [IdempotencyTestEvent.key]: [IdempotencyTestEvent, [subscriber]],
+      };
+
+      const transport = new RabbitMQTransport({
+        url: connectionUrl,
+        connectionName: `idempotent-yes-${Date.now()}`,
+        quorumQueues: false,
+        defaultPrefetch: 1,
+      });
+
+      // Pre-seed the queue and force a native redelivery *before* Matador starts
+      // consuming, so the very first delivery its real pipeline sees already
+      // carries the broker's redelivered:true flag.
+      await transport.connect();
+      await transport.applyTopology(topology);
+      await transport.send(
+        queueName,
+        createEnvelope({
+          eventKey: IdempotencyTestEvent.key,
+          targetSubscriber: subscriber.name,
+          data: { id: 'idempotent-yes' },
+          importance: 'should-investigate',
+        }),
+      );
+      await forceNativeRedelivery(queueName);
+
+      matador = new Matador({
+        transport,
+        topology,
+        schema,
+        consumeFrom: ['events'],
+        retryPolicy: new StandardRetryPolicy({ baseDelay: 0, maxDelay: 0 }),
+      });
+      await matador.start();
+
+      // Wait for processing
+      await matador.waitForIdle(10_000);
+
+      expect(callCount).toBe(1);
+      expect(success).toBeTruthy();
     });
   });
 });

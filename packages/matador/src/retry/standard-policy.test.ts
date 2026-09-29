@@ -152,6 +152,83 @@ describe('StandardRetryPolicy', () => {
       assertRetry(decision);
       expect(decision.delay).toBeDefined();
     });
+
+    it('should dead-letter as poisoned when delivery count reaches the threshold', () => {
+      const policy = new StandardRetryPolicy({ maxDeliveries: 5 });
+      const context = createContext(new Error('Generic error'), {
+        attemptNumber: 1,
+        deliveryCount: 5,
+      });
+
+      const decision = policy.shouldRetry(context);
+
+      expect(decision.action).toBe('dead-letter');
+      assertDeadLetter(decision);
+      expect(decision.queue).toBe('undeliverable');
+      expect(decision.reason).toContain('Possible poison message');
+    });
+
+    it('should take priority over other rules once poisoned', () => {
+      // Even a DontRetry-worthy error should still report as poisoned once
+      // delivery count is at/above the threshold, since poison detection
+      // runs first.
+      const policy = new StandardRetryPolicy({ maxDeliveries: 5 });
+      const context = createContext(new DoRetry('Temporary failure'), {
+        attemptNumber: 1,
+        deliveryCount: 5,
+      });
+
+      const decision = policy.shouldRetry(context);
+
+      assertDeadLetter(decision);
+      expect(decision.reason).toContain('Possible poison message');
+    });
+  });
+
+  describe('shouldProcess', () => {
+    it('should return pass when delivery count is under the threshold', () => {
+      const policy = new StandardRetryPolicy({ maxDeliveries: 5 });
+      const { envelope, subscriber, receipt } = createProcessContext({
+        deliveryCount: 4,
+      });
+
+      const decision = policy.shouldProcess({ envelope, subscriber, receipt });
+
+      expect(decision.action).toBe('process');
+    });
+
+    it('should dead-letter when delivery count is at/above the threshold, without an error', () => {
+      const policy = new StandardRetryPolicy({ maxDeliveries: 5 });
+      const { envelope, subscriber, receipt } = createProcessContext({
+        deliveryCount: 5,
+      });
+
+      const decision = policy.shouldProcess({ envelope, subscriber, receipt });
+
+      expect(decision.action).toBe('dead-letter');
+      if (decision.action !== 'dead-letter') {
+        throw new Error(`Expected dead-letter action, got ${decision.action}`);
+      }
+      expect(decision.queue).toBe('undeliverable');
+      expect(decision.reason).toContain('Possible poison message');
+    });
+
+    it('should agree with shouldRetry on the same poisoned receipt', () => {
+      // shouldProcess and shouldRetry share the same poison-detection logic, so
+      // a message flagged by one must be flagged the same way by the other.
+      const policy = new StandardRetryPolicy({ maxDeliveries: 5 });
+      const receiptOverrides = { attemptNumber: 1, deliveryCount: 5 };
+      const context = createContext(new Error('Some error'), receiptOverrides);
+
+      const processDecision = policy.shouldProcess({
+        envelope: context.envelope,
+        subscriber: context.subscriber,
+        receipt: context.receipt,
+      });
+      const shouldRetryDecision = policy.shouldRetry(context);
+
+      expect(processDecision as RetryDecision).toEqual(shouldRetryDecision);
+    });
   });
 
   describe('getDelay', () => {
@@ -287,4 +364,16 @@ function createContext(
     receipt,
     subscriber,
   };
+}
+
+function createProcessContext(receiptOverrides: Partial<MessageReceipt> = {}): {
+  envelope: RetryContext['envelope'];
+  subscriber: SubscriberDefinition;
+  receipt: MessageReceipt;
+} {
+  const { envelope, subscriber, receipt } = createContext(
+    new Error('unused'),
+    receiptOverrides,
+  );
+  return { envelope, subscriber, receipt };
 }
