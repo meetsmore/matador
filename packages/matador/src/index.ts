@@ -3,6 +3,7 @@ export type {
   FanoutConfig,
   HandlersState,
   MatadorConfig,
+  MatadorStartupRetryConfig,
   SendError,
   SendResult,
   ShutdownConfig,
